@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MovieStreamer — Now Showing</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #07060a;
+      --curtain-1: #4a0a12;
+      --curtain-2: #6b101c;
+      --curtain-3: #2e060c;
+      --gold:      #c9a227;
+      --text:      #f0e9dc;
+      --muted:     #8a8175;
+      --live:      #e50914;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    .theater {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Curtains ───────────────────────────────────────── */
+    .curtain {
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      width: 14vw;
+      z-index: 6;
+      background:
+        repeating-linear-gradient(90deg,
+          var(--curtain-3) 0,
+          var(--curtain-1) 1.6vw,
+          var(--curtain-2) 2.6vw,
+          var(--curtain-1) 3.6vw,
+          var(--curtain-3) 5.2vw);
+      box-shadow: inset 0 -18vh 14vh rgba(0,0,0,.7);
+    }
+    .curtain.left  { left: 0;  border-right: 2px solid rgba(0,0,0,.6); }
+    .curtain.right { right: 0; border-left:  2px solid rgba(0,0,0,.6); }
+
+    .valance {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 11vh;
+      z-index: 7;
+      background:
+        repeating-linear-gradient(90deg,
+          var(--curtain-3) 0,
+          var(--curtain-1) 2.2vw,
+          var(--curtain-2) 3.4vw,
+          var(--curtain-1) 4.6vw,
+          var(--curtain-3) 6.6vw);
+      border-bottom: 3px solid var(--gold);
+      box-shadow: 0 6px 24px rgba(0,0,0,.8);
+    }
+
+    /* scalloped bottom edge of the valance */
+    .valance::after {
+      content: '';
+      position: absolute;
+      left: 0; right: 0;
+      bottom: -4.5vh;
+      height: 4.5vh;
+      background:
+        radial-gradient(ellipse 4vw 4.5vh at 50% 0%, var(--curtain-1) 98%, transparent 100%);
+      background-size: 6.6vw 4.5vh;
+      background-repeat: repeat-x;
+      filter: drop-shadow(0 5px 6px rgba(0,0,0,.55));
+    }
+
+    /* ── Marquee ────────────────────────────────────────── */
+    .marquee {
+      position: fixed;
+      top: 3.2vh;
+      left: 0; right: 0;
+      z-index: 8;
+      text-align: center;
+      font-size: clamp(13px, 1.6vw, 19px);
+      font-weight: 700;
+      letter-spacing: 6px;
+      color: var(--gold);
+      text-transform: uppercase;
+      text-shadow: 0 0 18px rgba(201,162,39,.5);
+    }
+
+    /* ── Screen ─────────────────────────────────────────── */
+    .screen-wrap {
+      position: relative;
+      z-index: 4;
+      width: min(68vw, calc((78vh) * 16 / 9));
+    }
+
+    .screen {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border: 6px solid #1c1812;
+      border-radius: 4px;
+      box-shadow:
+        0 0 0 1px rgba(201,162,39,.35),
+        0 0 90px 12px rgba(150,160,255,.10),
+        0 30px 80px rgba(0,0,0,.9);
+      overflow: hidden;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      pointer-events: none;   /* viewers don't touch the player */
+    }
+
+    video::-webkit-media-controls { display: none !important; }
+
+    /* ── Control bar: clock + fullscreen (display only) ── */
+    .ctrlbar {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      z-index: 5;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: linear-gradient(to top, rgba(0,0,0,.78), transparent);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s;
+    }
+    .ctrlbar.on { display: flex; }
+    .ctrlbar.on.show { opacity: 1; pointer-events: auto; }
+
+    /* clear screen after inactivity: cursor goes too */
+    body.noptr, body.noptr * { cursor: none !important; }
+
+    .clock {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .6px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      text-shadow: 0 1px 3px #000;
+    }
+
+    .fsbtn {
+      background: none;
+      border: none;
+      padding: 4px;
+      cursor: pointer;
+      color: var(--text);
+      display: flex;
+      transition: color .2s, transform .2s;
+    }
+    .fsbtn:hover { color: var(--gold); transform: scale(1.12); }
+    .fsbtn svg { width: 20px; height: 20px; }
+    .fsbtn .ic-exit { display: none; }
+    .fsbtn.infs .ic-enter { display: none; }
+    .fsbtn.infs .ic-exit  { display: block; }
+
+    /* fullscreen: the screen fills the display, theater chrome stays behind */
+    .screen-wrap:fullscreen {
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+    .screen-wrap:fullscreen .screen {
+      width: 100%;
+      height: 100%;
+      aspect-ratio: auto;
+      border: none;
+      border-radius: 0;
+      box-shadow: none;
+    }
+    .screen-wrap:fullscreen .glow { display: none; }
+
+    /* light spill under the screen */
+    .glow {
+      position: absolute;
+      left: 8%; right: 8%;
+      bottom: -9vh;
+      height: 9vh;
+      background: radial-gradient(ellipse at 50% 0%, rgba(160,170,255,.14), transparent 70%);
+      pointer-events: none;
+    }
+
+    /* ── LIVE badge ─────────────────────────────────────── */
+    .badge {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--live);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 1.8px;
+      padding: 5px 11px;
+      border-radius: 3px;
+      opacity: 0;
+      transform: scale(.85);
+      transition: opacity .35s, transform .35s;
+    }
+    .badge.on { opacity: 1; transform: scale(1); }
+
+    .badge.paused { background: var(--gold); color: #1d1607; }
+    .badge.paused .badge-dot { background: #1d1607; animation: none; }
+
+    .badge-dot {
+      width: 7px; height: 7px;
+      background: #fff;
+      border-radius: 50%;
+      animation: blink 1.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.25 } }
+
+    /* ── Seats ──────────────────────────────────────────── */
+    .seats {
+      position: fixed;
+      left: 0; right: 0;
+      bottom: 0;
+      height: 13vh;
+      z-index: 9;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse 3.2vw 8vh at 50% 105%, #15121c 99%, transparent 100%) repeat-x;
+      background-size: 5.2vw 13vh;
+      filter: drop-shadow(0 -4px 14px rgba(0,0,0,.9));
+    }
+    .seats.back {
+      height: 9vh;
+      z-index: 8;
+      opacity: .65;
+      background-size: 4vw 9vh;
+      background-position: 2vw 0;
+    }
+
+    /* ── Overlay (waiting / ended) ──────────────────────── */
+    .overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 13px;
+      background: radial-gradient(ellipse at 50% 40%, #100e16 0%, #000 75%);
+      transition: opacity .6s ease;
+    }
+    .overlay.gone { opacity: 0; pointer-events: none; }
+
+    .ov-icon  { font-size: 46px; animation: float 3.5s ease-in-out infinite; }
+    @keyframes float { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-8px) } }
+
+    .ov-title { font-size: clamp(16px, 2vw, 24px); font-weight: 600; letter-spacing: .4px; }
+    .ov-sub   { font-size: 13px; color: var(--muted); }
+
+    .scan {
+      width: 170px; height: 2px;
+      margin-top: 8px;
+      overflow: hidden;
+      border-radius: 2px;
+      background: #1a1720;
+    }
+    .scan-inner {
+      width: 60%; height: 100%;
+      background: linear-gradient(to right, transparent, var(--gold), transparent);
+      animation: sweep 1.8s ease-in-out infinite;
+    }
+    @keyframes sweep { 0% { transform: translateX(-100%) } 100% { transform: translateX(267%) } }
+
+    /* ── Sound pill ─────────────────────────────────────── */
+    .unmute {
+      position: absolute;
+      bottom: 14%;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: none;
+      align-items: center;
+      gap: 9px;
+      background: rgba(20,17,26,.92);
+      color: var(--text);
+      border: 1px solid rgba(201,162,39,.55);
+      border-radius: 999px;
+      padding: 11px 22px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: .3px;
+      cursor: pointer;
+      box-shadow: 0 8px 30px rgba(0,0,0,.7);
+      transition: border-color .2s, transform .2s;
+    }
+    .unmute:hover { border-color: var(--gold); transform: translateX(-50%) scale(1.04); }
+    .unmute.show  { display: flex; }
+  </style>
+</head>
+<body>
+
+  <div class="valance"></div>
+  <div class="marquee">Now Showing</div>
+  <div class="curtain left"></div>
+  <div class="curtain right"></div>
+
+  <div class="theater">
+    <div class="screen-wrap">
+      <div class="badge" id="badge"><span class="badge-dot"></span><span id="badgeText">LIVE</span></div>
+      <div class="screen">
+        <video id="player" autoplay muted playsinline crossorigin="anonymous"></video>
+        <div class="overlay" id="overlay">
+          <div class="ov-icon"  id="ovIcon">🎭</div>
+          <div class="ov-title" id="ovTitle">The show hasn't started yet</div>
+          <div class="ov-sub"   id="ovSub">Take your seat — the broadcast will begin shortly</div>
+          <div class="scan" id="scan"><div class="scan-inner"></div></div>
+        </div>
+
+        <div class="ctrlbar" id="ctrlbar">
+          <span class="clock" id="clock">00:00:00 / 00:00:00</span>
+          <button class="fsbtn" id="fsbtn" title="Fullscreen">
+            <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/>
+              <path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+            </svg>
+            <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/>
+              <path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/>
+            </svg>
+          </button>
+        </div>
+
+        <button class="unmute" id="unmute">🔊&nbsp; Tap for sound</button>
+      </div>
+      <div class="glow"></div>
+    </div>
+  </div>
+
+  <div class="seats back"></div>
+  <div class="seats"></div>
+
+  <script>
+    const player  = document.getElementById('player');
+    const overlay = document.getElementById('overlay');
+    const badge   = document.getElementById('badge');
+    const ovIcon  = document.getElementById('ovIcon');
+    const ovTitle = document.getElementById('ovTitle');
+    const ovSub   = document.getElementById('ovSub');
+    const scan    = document.getElementById('scan');
+    const unmute  = document.getElementById('unmute');
+    const ctrlbar = document.getElementById('ctrlbar');
+    const clock   = document.getElementById('clock');
+    const fsbtn   = document.getElementById('fsbtn');
+    const screenWrap = document.querySelector('.screen-wrap');
+
+    let live = false;
+    let duration = 0;
+    let serverPaused = false;
+    const badgeText = document.getElementById('badgeText');
+
+    // ── Clock ───────────────────────────────────────────
+    function fmt(t) {
+      t = Math.max(0, Math.floor(t));
+      const h = String(Math.floor(t / 3600)).padStart(2, '0');
+      const m = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
+      const s = String(t % 60).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+    setInterval(() => {
+      if (live) clock.textContent = `${fmt(player.currentTime)} / ${fmt(duration)}`;
+    }, 500);
+
+    // ── Fullscreen ──────────────────────────────────────
+    function inFullscreen() {
+      return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+    fsbtn.addEventListener('click', () => {
+      if (inFullscreen()) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else {
+        (screenWrap.requestFullscreen || screenWrap.webkitRequestFullscreen).call(screenWrap);
+      }
+    });
+    for (const ev of ['fullscreenchange', 'webkitfullscreenchange']) {
+      document.addEventListener(ev, () => fsbtn.classList.toggle('infs', inFullscreen()));
+    }
+
+    // ── Inactivity: clear the screen ────────────────────
+    // Any input shows the clock, fullscreen toggle, and cursor; 3 s of
+    // stillness hides them all while the show is playing.
+    let idleTimer = null;
+    function activity() {
+      document.body.classList.remove('noptr');
+      ctrlbar.classList.add('show');
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (!live) return;
+        ctrlbar.classList.remove('show');
+        document.body.classList.add('noptr');
+      }, 3000);
+    }
+    for (const ev of ['mousemove', 'mousedown', 'keydown', 'touchstart']) {
+      document.addEventListener(ev, activity, { passive: true });
+    }
+
+    // ── Viewers decide nothing ──────────────────────────
+    // No controls are rendered; the video ignores pointer events; if anything
+    // pauses playback while live (tab tricks, media keys), resume — unless the
+    // broadcast itself is paused; and the poll below snaps playback back to
+    // the broadcast clock if it drifts.
+    player.addEventListener('pause', () => {
+      if (live && !player.ended && !serverPaused) player.play().catch(() => {});
+    });
+
+    unmute.addEventListener('click', () => {
+      player.muted = false;
+      unmute.classList.remove('show');
+    });
+
+    function teardown() {
+      player.removeAttribute('src');
+      player.querySelectorAll('track').forEach(t => t.remove());
+      player.load();
+    }
+
+    function addSubtitles() {
+      const track = document.createElement('track');
+      track.kind    = 'subtitles';
+      track.label   = 'Subtitles';
+      track.srclang = 'en';
+      track.default = true;
+      track.src     = '/subtitles.vtt';
+      player.appendChild(track);
+      track.addEventListener('load', () => {
+        if (player.textTracks[0]) player.textTracks[0].mode = 'showing';
+      });
+    }
+
+    function goLive(status) {
+      live = true;
+      duration = status.duration || 0;
+      serverPaused = Boolean(status.paused);
+      badge.classList.toggle('paused', serverPaused);
+      badgeText.textContent = serverPaused ? 'INTERMISSION' : 'LIVE';
+      teardown();
+      player.muted = true;            // guarantees autoplay; pill restores sound
+      player.src = '/video';
+
+      // Join at the broadcast's current moment — like switching on a TV.
+      player.addEventListener('loadedmetadata', () => {
+        player.currentTime = status.elapsed || 0;
+        if (!serverPaused) player.play().catch(() => {});
+      }, { once: true });
+
+      if (status.hasSubtitles) addSubtitles();
+
+      overlay.classList.add('gone');
+      badge.classList.add('on');
+      unmute.classList.add('show');
+
+      // Reveal the bar so viewers discover the clock + fullscreen; the
+      // inactivity timer clears it (and the cursor) after 3 s.
+      ctrlbar.classList.add('on');
+      activity();
+    }
+
+    function showOverlay(icon, title, sub, showScan) {
+      live = false;
+      teardown();
+      badge.classList.remove('on');
+      unmute.classList.remove('show');
+      ctrlbar.classList.remove('on', 'show');
+      document.body.classList.remove('noptr');
+      if (inFullscreen()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      ovIcon.textContent  = icon;
+      ovTitle.textContent = title;
+      ovSub.textContent   = sub;
+      scan.style.display  = showScan ? 'block' : 'none';
+      overlay.classList.remove('gone');
+    }
+
+    const WAITING = ['🎭', "The show hasn't started yet", 'Take your seat — the broadcast will begin shortly', true];
+    const ENDED   = ['🎬', 'The show has ended', 'Thanks for watching', false];
+
+    player.addEventListener('ended', () => { if (live) showOverlay(...ENDED); });
+
+    async function poll() {
+      try {
+        const status = await fetch('/status').then(r => r.json());
+        if (status.active && !live) goLive(status);
+        if (!status.active && live) showOverlay(...ENDED);
+
+        // Intermission: the server clock is paused — freeze with it.
+        serverPaused = Boolean(status.paused);
+        if (live) {
+          badge.classList.toggle('paused', serverPaused);
+          badgeText.textContent = serverPaused ? 'INTERMISSION' : 'LIVE';
+          if (serverPaused && !player.paused) player.pause();
+          if (!serverPaused && player.paused && !player.ended) player.play().catch(() => {});
+        }
+
+        // Pin playback to the broadcast clock: if a viewer drifts (buffering,
+        // background-tab throttling, scripted seeks), snap back to live.
+        if (status.active && live && !serverPaused && player.readyState >= 1 &&
+            Math.abs(player.currentTime - status.elapsed) > 3) {
+          player.currentTime = status.elapsed;
+        }
+      } catch {}
+    }
+
+    showOverlay(...WAITING);
+    poll();
+    setInterval(poll, 2000);
+  </script>
+
+</body>
+</html>
