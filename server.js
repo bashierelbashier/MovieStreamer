@@ -163,17 +163,39 @@ const server = http.createServer(async (req, res) => {
     return res.end(fs.readFileSync(WATCH_PAGE, 'utf8'));
   }
 
-  // GET /video  — the movie itself, served in 1 MB range-request chunks
+  // GET /video  — the movie itself, via HTTP range requests. Safari demands
+  // strict spec compliance: an explicit end byte must be honored exactly
+  // (its first request probes with `bytes=0-1` and expects exactly 2 bytes),
+  // and a request without a Range header must get a plain 200.
   if (req.method === 'GET' && url.pathname === '/video') {
     if (!broadcast.active) return json(res, 503, { message: 'No active broadcast.' });
 
-    const range = req.headers.range || 'bytes=0-';
-    const start = Number(range.match(/\d+/)?.[0] ?? 0);
-    if (start >= broadcast.size) {
+    const range = req.headers.range;
+    if (!range) {
+      res.writeHead(200, {
+        'Content-Length': broadcast.size,
+        'Content-Type': broadcast.mimeType,
+        'Accept-Ranges': 'bytes',
+      });
+      return fs.createReadStream(broadcast.fullPath).pipe(res);
+    }
+
+    const m = range.match(/bytes=(\d*)-(\d*)/);
+    let start, end;
+    if (m && m[1] === '' && m[2] !== '') {
+      // suffix range: bytes=-N → final N bytes
+      start = Math.max(0, broadcast.size - Number(m[2]));
+      end = broadcast.size - 1;
+    } else {
+      start = Number(m?.[1] || 0);
+      end = m && m[2] !== ''
+        ? Math.min(Number(m[2]), broadcast.size - 1)   // explicit end: honor it
+        : Math.min(start + CHUNK_SIZE - 1, broadcast.size - 1); // open-ended: cap at 1 MB
+    }
+    if (start >= broadcast.size || start > end) {
       res.writeHead(416, { 'Content-Range': `bytes */${broadcast.size}` });
       return res.end();
     }
-    const end = Math.min(start + CHUNK_SIZE - 1, broadcast.size - 1);
 
     res.writeHead(206, {
       'Content-Range': `bytes ${start}-${end}/${broadcast.size}`,
