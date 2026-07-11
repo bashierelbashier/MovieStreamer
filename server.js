@@ -81,10 +81,15 @@ function resumeBroadcast() {
   console.log(`[broadcast] resumed at ${Math.round(elapsed())}s`);
 }
 
-async function startBroadcast(name) {
+async function startBroadcast(name, startAt = 0) {
   const fullPath = path.join(MOVIE_DIR, name);
   const duration = await probeDuration(fullPath);
   if (!duration) return `Could not read duration from ${name}.`;
+
+  // Start the movie `startAt` seconds in by pretending the broadcast began that
+  // long ago — every clock reader (elapsed(), /video, /status, subtitles) is
+  // derived from startedAt, so nothing else needs to know about the offset.
+  const at = Math.min(Math.max(startAt, 0), duration);
 
   broadcast.active = true;
   broadcast.filename = name;
@@ -92,13 +97,13 @@ async function startBroadcast(name) {
   broadcast.mimeType = MIME[path.extname(name).toLowerCase()];
   broadcast.size = fs.statSync(fullPath).size;
   broadcast.duration = duration;
-  broadcast.startedAt = Date.now();
+  broadcast.startedAt = Date.now() - at * 1000;
   broadcast.cues = loadSubtitleCues();
 
   // The broadcast ends when the movie does — by the clock, not by viewers.
-  broadcast.endTimer = setTimeout(stopBroadcast, duration * 1000);
+  broadcast.endTimer = setTimeout(stopBroadcast, (duration - at) * 1000);
 
-  console.log(`[broadcast] started — ${name} (${Math.round(duration)}s)`);
+  console.log(`[broadcast] started — ${name} (${Math.round(duration)}s)${at ? ` at ${Math.round(at)}s` : ''}`);
   return null;
 }
 
@@ -132,9 +137,18 @@ const server = http.createServer(async (req, res) => {
     if (broadcast.active) return json(res, 409, { success: false, message: 'Already streaming.' });
     const name = findFile(Object.keys(MIME));
     if (!name) return json(res, 404, { success: false, message: 'No movie file found in current_movie/.' });
-    const error = await startBroadcast(name);
+    // Optional ?at=SECONDS starts the movie that far in (default 0 = beginning).
+    let startAt = 0;
+    if (url.searchParams.has('at')) {
+      startAt = Number(url.searchParams.get('at'));
+      if (!Number.isFinite(startAt) || startAt < 0) {
+        return json(res, 400, { success: false, message: 'Invalid "at": expected a non-negative number of seconds.' });
+      }
+    }
+    const error = await startBroadcast(name, startAt);
     if (error) return json(res, 500, { success: false, message: error });
-    return json(res, 200, { success: true, message: `Streaming started: ${name}` });
+    const started = Math.round(elapsed());
+    return json(res, 200, { success: true, message: `Streaming started: ${name}${started ? ` at ${started}s` : ''}` });
   }
 
   // GET or POST /pause-streaming  — toggles intermission: first call pauses the
