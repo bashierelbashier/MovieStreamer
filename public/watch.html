@@ -361,7 +361,13 @@
   <div class="seats back"></div>
   <div class="seats"></div>
 
-  <script>
+  <script type="module">
+    import {
+      decideResync,
+      estimateLiveElapsed,
+      extrapolateElapsed,
+    } from '/resync.js';
+
     const player  = document.getElementById('player');
     const overlay = document.getElementById('overlay');
     const badge   = document.getElementById('badge');
@@ -378,9 +384,61 @@
     let live = false;
     let duration = 0;
     let serverPaused = false;
+    let buffering = false;
+    let lastSeekAtMs = 0;
+    let lastDeferLogAt = 0;
+    let lastRateLogAt = 0;
+    let joinElapsed = 0;
+    // Sampled broadcast clock: extrapolated between /status polls so every
+    // viewer shares the same "now" regardless of when they opened the page.
+    let clockSample = null; // { baseElapsed, baseAtMs, paused }
     const badgeText = document.getElementById('badgeText');
 
-    // ── Clock ───────────────────────────────────────────
+    // ── Client logging (problems only + structured meta) ─
+    function clog(level, message, meta) {
+      const line = `[watch] ${message}`;
+      const args = meta === undefined ? [line] : [line, meta];
+      if (level === 'error') console.error(...args);
+      else if (level === 'warn') console.warn(...args);
+      else console.log(...args);
+    }
+
+    function sampleClock(status, rttMs) {
+      const baseElapsed = estimateLiveElapsed({
+        elapsed: status.elapsed || 0,
+        paused: status.paused,
+        rttMs,
+        serverTime: status.serverTime,
+        clientRecvWallMs: Date.now(),
+      });
+      clockSample = {
+        baseElapsed,
+        baseAtMs: performance.now(),
+        paused: Boolean(status.paused),
+      };
+      return baseElapsed;
+    }
+
+    function broadcastNow() {
+      if (!clockSample) return 0;
+      return extrapolateElapsed(
+        clockSample.baseElapsed,
+        clockSample.baseAtMs,
+        performance.now(),
+        clockSample.paused || serverPaused,
+      );
+    }
+
+    function setPlaybackRate(rate) {
+      if (Math.abs((player.playbackRate || 1) - rate) < 0.005) return;
+      try {
+        player.playbackRate = rate;
+      } catch (e) {
+        clog('warn', 'playbackRate set failed', { rate, message: e.message });
+      }
+    }
+
+    // ── Clock UI ────────────────────────────────────────
     function fmt(t) {
       t = Math.max(0, Math.floor(t));
       const h = String(Math.floor(t / 3600)).padStart(2, '0');
@@ -408,8 +466,6 @@
     }
 
     // ── Inactivity: clear the screen ────────────────────
-    // Any input shows the clock, fullscreen toggle, and cursor; 3 s of
-    // stillness hides them all while the show is playing.
     let idleTimer = null;
     function activity() {
       document.body.classList.remove('noptr');
@@ -425,13 +481,45 @@
       document.addEventListener(ev, activity, { passive: true });
     }
 
+    // ── Buffer / media health ───────────────────────────
+    player.addEventListener('waiting', () => {
+      buffering = true;
+      clog('warn', 'buffering (waiting for data)', {
+        t: player.currentTime,
+        readyState: player.readyState,
+        networkState: player.networkState,
+      });
+    });
+    player.addEventListener('stalled', () => {
+      buffering = true;
+      clog('warn', 'playback stalled', {
+        t: player.currentTime,
+        readyState: player.readyState,
+        networkState: player.networkState,
+      });
+    });
+    player.addEventListener('playing', () => { buffering = false; });
+    player.addEventListener('canplay', () => { buffering = false; });
+    player.addEventListener('canplaythrough', () => { buffering = false; });
+    player.addEventListener('seeking', () => { buffering = true; });
+    player.addEventListener('seeked', () => {
+      // After a seek the browser may still need more data before play is smooth.
+      if (player.readyState >= 3) buffering = false;
+    });
+    player.addEventListener('error', () => {
+      const err = player.error;
+      clog('error', 'media element error', {
+        code: err?.code,
+        message: err?.message,
+        src: player.currentSrc,
+      });
+    });
+
     // ── Viewers decide nothing ──────────────────────────
-    // No controls are rendered; the video ignores pointer events; if anything
-    // pauses playback while live (tab tricks, media keys), resume — unless the
-    // broadcast itself is paused; and the poll below snaps playback back to
-    // the broadcast clock if it drifts.
     player.addEventListener('pause', () => {
-      if (live && !player.ended && !serverPaused) player.play().catch(() => {});
+      if (live && !player.ended && !serverPaused) {
+        player.play().catch((e) => clog('warn', 'auto-resume play() failed', { message: e.message }));
+      }
     });
 
     unmute.addEventListener('click', () => {
@@ -439,10 +527,20 @@
       unmute.classList.remove('show');
     });
 
-    function teardown() {
+    function resetPlayerMedia() {
       player.removeAttribute('src');
       player.querySelectorAll('track').forEach(t => t.remove());
-      player.load();
+      try { player.load(); } catch (e) {
+        clog('warn', 'player.load() after teardown failed', { message: e.message });
+      }
+      buffering = false;
+      setPlaybackRate(1);
+    }
+
+    function teardown() {
+      resetPlayerMedia();
+      lastSeekAtMs = 0;
+      clockSample = null;
     }
 
     function addSubtitles() {
@@ -456,22 +554,53 @@
       track.addEventListener('load', () => {
         if (player.textTracks[0]) player.textTracks[0].mode = 'showing';
       });
+      track.addEventListener('error', () => clog('error', 'subtitle track failed to load'));
     }
 
-    function goLive(status) {
+    function goLive(status, rttMs = 0) {
       live = true;
       duration = status.duration || 0;
       serverPaused = Boolean(status.paused);
       badge.classList.toggle('paused', serverPaused);
       badgeText.textContent = serverPaused ? 'INTERMISSION' : 'LIVE';
-      teardown();
+      resetPlayerMedia();
+      lastSeekAtMs = 0;
+      joinElapsed = sampleClock(status, rttMs);
       player.muted = true;            // guarantees autoplay; pill restores sound
       player.src = '/video';
+      clog('info', 'joining broadcast', {
+        elapsed: joinElapsed,
+        duration,
+        paused: serverPaused,
+        hasSubtitles: status.hasSubtitles,
+        rttMs: Math.round(rttMs),
+      });
 
-      // Join at the broadcast's current moment — like switching on a TV.
-      player.addEventListener('loadedmetadata', () => {
-        player.currentTime = status.elapsed || 0;
-        if (!serverPaused) player.play().catch(() => {});
+      // Join at the broadcast's *current* moment. Re-probe /status after
+      // metadata loads so the seek target includes load delay + RTT.
+      player.addEventListener('loadedmetadata', async () => {
+        let target = broadcastNow();
+        try {
+          const t0 = performance.now();
+          const res = await fetch('/status');
+          const st = await res.json();
+          const rtt = performance.now() - t0;
+          if (st.active) {
+            target = sampleClock(st, rtt);
+            serverPaused = Boolean(st.paused);
+          }
+        } catch (e) {
+          clog('warn', 'join status refresh failed; using extrapolated clock', { message: e.message });
+          target = broadcastNow();
+        }
+        lastSeekAtMs = Date.now();
+        buffering = true;
+        setPlaybackRate(1);
+        player.currentTime = target;
+        clog('info', 'join seek', { target: Number(target.toFixed(3)) });
+        if (!serverPaused) {
+          player.play().catch((e) => clog('warn', 'initial play() failed', { message: e.message }));
+        }
       }, { once: true });
 
       if (status.hasSubtitles) addSubtitles();
@@ -479,9 +608,6 @@
       overlay.classList.add('gone');
       badge.classList.add('on');
       unmute.classList.add('show');
-
-      // Reveal the bar so viewers discover the clock + fullscreen; the
-      // inactivity timer clears it (and the cursor) after 3 s.
       ctrlbar.classList.add('on');
       activity();
     }
@@ -506,33 +632,111 @@
 
     player.addEventListener('ended', () => { if (live) showOverlay(...ENDED); });
 
+    function applyResync() {
+      if (!live || !clockSample) return;
+
+      const broadcastElapsed = broadcastNow();
+      const decision = decideResync({
+        playerTime: player.currentTime,
+        broadcastElapsed,
+        buffering,
+        readyState: player.readyState,
+        nowMs: Date.now(),
+        lastSeekAtMs,
+        serverPaused,
+        live,
+      });
+
+      if (decision.action === 'rate') {
+        setPlaybackRate(decision.rate);
+        // Log only meaningful nudges, not the steady "synced → 1.0" state.
+        if (decision.reason === 'rate-nudge' || decision.reason === 'cooldown-rate') {
+          const now = Date.now();
+          if (now - lastRateLogAt > 8000) {
+            lastRateLogAt = now;
+            clog('warn', 'rate-nudge toward broadcast clock', {
+              reason: decision.reason,
+              rate: decision.rate,
+              drift: Number(decision.drift.toFixed(3)),
+              player: Number(player.currentTime.toFixed(3)),
+              broadcast: Number(broadcastElapsed.toFixed(3)),
+            });
+          }
+        }
+      } else if (decision.action === 'seek') {
+        clog('warn', 're-sync to broadcast clock', {
+          reason: decision.reason,
+          from: Number(player.currentTime.toFixed(2)),
+          to: Number(decision.target.toFixed(2)),
+          drift: Number(decision.drift.toFixed(2)),
+          readyState: player.readyState,
+          buffering,
+        });
+        lastSeekAtMs = Date.now();
+        buffering = true;
+        setPlaybackRate(1);
+        player.currentTime = decision.target;
+        if (!serverPaused && player.paused && !player.ended) {
+          player.play().catch((e) => clog('warn', 'post-seek play() failed', { message: e.message }));
+        }
+      } else if (decision.action === 'defer') {
+        setPlaybackRate(1);
+        const now = Date.now();
+        if (now - lastDeferLogAt > 8000) {
+          lastDeferLogAt = now;
+          clog('warn', 'drift detected — deferring re-sync', {
+            reason: decision.reason,
+            drift: Number(decision.drift.toFixed(2)),
+            readyState: player.readyState,
+            buffering,
+          });
+        }
+      }
+    }
+
     async function poll() {
       try {
-        const status = await fetch('/status').then(r => r.json());
-        if (status.active && !live) goLive(status);
+        const t0 = performance.now();
+        const res = await fetch('/status');
+        if (!res.ok) {
+          clog('error', 'status poll HTTP error', { status: res.status });
+          return;
+        }
+        const status = await res.json();
+        const rttMs = performance.now() - t0;
+
+        if (status.active) sampleClock(status, rttMs);
+
+        if (status.active && !live) goLive(status, rttMs);
         if (!status.active && live) showOverlay(...ENDED);
 
-        // Intermission: the server clock is paused — freeze with it.
         serverPaused = Boolean(status.paused);
+        if (clockSample) clockSample.paused = serverPaused;
+
         if (live) {
           badge.classList.toggle('paused', serverPaused);
           badgeText.textContent = serverPaused ? 'INTERMISSION' : 'LIVE';
-          if (serverPaused && !player.paused) player.pause();
-          if (!serverPaused && player.paused && !player.ended) player.play().catch(() => {});
+          if (serverPaused && !player.paused) {
+            setPlaybackRate(1);
+            player.pause();
+          }
+          if (!serverPaused && player.paused && !player.ended) {
+            player.play().catch((e) => clog('warn', 'intermission resume play() failed', { message: e.message }));
+          }
         }
 
-        // Pin playback to the broadcast clock: if a viewer drifts (buffering,
-        // background-tab throttling, scripted seeks), snap back to live.
-        if (status.active && live && !serverPaused && player.readyState >= 1 &&
-            Math.abs(player.currentTime - status.elapsed) > 3) {
-          player.currentTime = status.elapsed;
-        }
-      } catch {}
+        if (status.active && live) applyResync();
+      } catch (e) {
+        clog('error', 'status poll failed', { message: e.message });
+      }
     }
 
     showOverlay(...WAITING);
     poll();
-    setInterval(poll, 2000);
+    // Status sample ~1/s (cheap); rate nudge also runs between polls so
+    // viewers who opened at different times keep creeping together.
+    setInterval(poll, 1000);
+    setInterval(() => { if (live && !serverPaused) applyResync(); }, 500);
   </script>
 
 </body>
